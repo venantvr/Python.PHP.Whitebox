@@ -132,18 +132,8 @@ class TerminalReporter:
 
     def _banner(self) -> list[str]:
         c = self.c
-        banner_text = [
-            r"  ____  _   _ ____    ____              ____                  ",
-            r" |  _ \| | | |  _ \  / ___|  ___  ___  / ___|  ___ __ _ _ __  ",
-            r" | |_) | |_| | |_) | \___ \ / _ \/ __| \___ \ / __/ _` | '_ \ ",
-            r" |  __/|  _  |  __/ _ ___) |  __/ (__   ___) | (_| (_| | | | |",
-            r" |_|   |_| |_|_|  (_)____/ \___|\___|  |____/ \___\__,_|_| |_|",
-        ]
         lines = [self._separator()]
-        for row in banner_text:
-            lines.append(f"{c.CYAN}{c.BOLD}{row}{c.RESET}")
-        lines.append("")
-        lines.append(f"  {c.DIM}Static Security Scanner for PHP{c.RESET}")
+        lines.append(f"  {c.CYAN}{c.BOLD}PHP Sec Scan{c.RESET}  {c.DIM}— Static Security Scanner for PHP{c.RESET}")
         lines.append(self._separator())
         return lines
 
