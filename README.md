@@ -437,3 +437,7 @@ python3 -m pytest tests/integration/ -v
 | `cross_function.php` | Taint a travers les appels de fonctions |
 | `foreach_taint.php` | Propagation dans les boucles foreach |
 | `conditional_taint.php` | Taint dans les branches if/else |
+
+## Stack
+
+[![Stack](https://skillicons.dev/icons?i=py&theme=dark)](https://skillicons.dev)
