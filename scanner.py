@@ -2,39 +2,43 @@
 
 from __future__ import annotations
 
+import sys
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from parser.php_parser import parse_php_file
 from parser.scope_analyzer import ScopeAnalyzer
 from parser.include_resolver import IncludeResolver
-from analysis.taint_tracker import TaintTracker
+from analysis.taint_tracker import TaintTracker, findings_from_uncalled_summaries
 from analysis.cross_file_context import CrossFileContext
 from analysis.pattern_detector import PatternDetector
 from analysis.context_analyzer import ContextAnalyzer
 from config.loader import load_rules, RulesConfig
+from config.schema import Confidence
 from detectors import get_enabled_detectors, get_all_detectors
-from report.finding import Finding, ScanResult, ScanSummary, compute_summary
+from report.finding import Finding, ScanResult, compute_summary, SCANNER_VERSION
 from utils.filewalker import find_php_files
 from utils.progress import ProgressTracker
 
 if TYPE_CHECKING:
     from config.schema import ScanConfig
 
+# Les longues concatenations PHP produisent des AST profonds.
+sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+
 
 class Scanner:
     """Pipeline principal de scan Python.PHP.Whitebox.
 
-    Phase 1: Discovery   -> Trouver tous les fichiers PHP
-    Phase 2: Parsing     -> Parser chaque fichier avec tree-sitter
-    Phase 3: Scoping     -> Extraire fonctions/classes/methodes
-    Phase 4: Linking     -> Construire le graphe d'includes
-    Phase 5: Analysis    -> Taint tracking par fichier
-    Phase 6: Detection   -> Detecteurs specialises + patterns
-    Phase 7: Reporting   -> Assemblage du resultat
+    Phase 1: Discovery    -> Trouver tous les fichiers PHP
+    Phase 2: Parsing      -> Parser chaque fichier avec tree-sitter
+    Phase 3: Scoping      -> Extraire fonctions/classes/methodes
+    Phase 4: Linking      -> Construire le graphe d'includes
+    Phase 5: Summarizing  -> Resumes taint de toutes les fonctions (inter-procedural, inter-fichiers)
+    Phase 6: Analysis     -> Taint tracking + patterns + detecteurs par fichier
+    Phase 7: Reporting    -> Assemblage du resultat
     """
 
     def __init__(self, config: "ScanConfig"):
@@ -58,6 +62,7 @@ class Scanner:
         php_files = find_php_files(
             self.config.project_path,
             exclude_patterns=self.config.exclude_patterns,
+            extensions=self.config.extensions,
         )
         self.progress.finish_phase(f"Found {len(php_files)} PHP files")
 
@@ -74,13 +79,13 @@ class Scanner:
                 tree, source = parse_php_file(fpath)
                 parsed_files[fpath] = (tree, source)
                 total_lines += source.count("\n") + 1
-
-                # Scope extraction
+                if tree.root_node.has_error:
+                    errors.append({"phase": "parse", "file": fpath, "level": "warning",
+                                   "error": "syntax errors in file (analysis continues on recovered AST)"})
                 scopes = scope_analyzer.extract(tree, source, fpath)
                 self.global_context.scope_map[fpath] = scopes
-
             except Exception as e:
-                errors.append({"phase": "parse", "file": fpath, "error": str(e)})
+                errors.append({"phase": "parse", "file": fpath, "level": "error", "error": str(e)})
             self.progress.advance()
 
         self.progress.finish_phase(f"Parsed {len(parsed_files)} files, {total_lines:,} lines")
@@ -93,31 +98,39 @@ class Scanner:
                 includes = resolver.find_includes(tree, source, fpath)
                 self.global_context.register_includes(fpath, includes)
             except Exception as e:
-                errors.append({"phase": "linking", "file": fpath, "error": str(e)})
+                errors.append({"phase": "linking", "file": fpath, "level": "error", "error": str(e)})
         self.progress.finish_phase("Include graph built")
 
-        # Phase 5 + 6: Analysis + Detection
-        self.progress.start_phase("Analyzing", total=len(parsed_files))
+        ordered_files = [f for f in self.global_context.topological_file_order(parsed_files.keys()) if f in parsed_files]
 
-        # Preparer les detecteurs
+        # Phase 5: Function summaries (toutes les fonctions du projet, avant l'analyse)
+        self.progress.start_phase("Summarizing functions", total=len(ordered_files))
+        for fpath in ordered_files:
+            tree, source = parsed_files[fpath]
+            try:
+                TaintTracker(source, tree, fpath, self.rules, self.global_context).analyze(summaries_only=True)
+            except RecursionError:
+                errors.append({"phase": "summary", "file": fpath, "level": "warning", "error": "AST too deep, summaries skipped"})
+            except Exception as e:
+                errors.append({"phase": "summary", "file": fpath, "level": "error", "error": str(e)})
+            self.progress.advance()
+        self.progress.finish_phase(f"Summarized {len(self.global_context.all_summaries())} functions")
+
+        # Phase 6: Analysis + Detection
+        self.progress.start_phase("Analyzing", total=len(ordered_files))
+
         if self.config.vuln_types:
             detectors = get_enabled_detectors(self.config.vuln_types, self.rules)
         else:
             detectors = get_all_detectors(self.rules)
+        detector_types = {d.vuln_type for d in detectors}
 
         pattern_detector = PatternDetector(self.rules)
         context_analyzer = ContextAnalyzer()
 
-        # Ordre topologique (fichiers inclus d'abord)
-        ordered_files = self.global_context.topological_file_order(parsed_files.keys())
-
         for fpath in ordered_files:
-            if fpath not in parsed_files:
-                continue
             tree, source = parsed_files[fpath]
-
             try:
-                # Taint analysis
                 tracker = TaintTracker(
                     source_code=source,
                     tree=tree,
@@ -126,39 +139,60 @@ class Scanner:
                     global_context=self.global_context,
                 )
                 taint_findings = tracker.analyze()
+                pattern_findings = pattern_detector.scan_file(fpath, source, tree)
+                file_findings = context_analyzer.refine_findings(taint_findings + pattern_findings, source)
 
-                # Pattern detection (secrets, crypto, configs)
-                pattern_findings = pattern_detector.scan_file(fpath, source)
-
-                # Combine
-                file_findings = taint_findings + pattern_findings
-
-                # Post-traitement contextuel
-                file_findings = context_analyzer.refine_findings(file_findings, source)
-
-                # Passer par les detecteurs specialises
                 refined: list[Finding] = []
                 for detector in detectors:
                     refined.extend(detector.detect(file_findings, fpath, source))
-
-                # Aussi garder les findings de patterns (pas lies a un detecteur specifique)
-                pattern_types = {f.vuln_type for f in pattern_findings}
-                detector_types = {d.vuln_type for d in detectors}
+                # Findings de patterns sans detecteur dedie (ex: dangerous_config si filtre par type)
                 for f in file_findings:
-                    if f.vuln_type in pattern_types and f.vuln_type not in detector_types:
+                    if f.detection_mode == "pattern" and f.vuln_type not in detector_types \
+                            and (not self.config.vuln_types or f.vuln_type in self.config.vuln_types):
                         refined.append(f)
 
                 all_findings.extend(refined)
-
+            except RecursionError:
+                errors.append({"phase": "analysis", "file": fpath, "level": "warning", "error": "AST too deep, taint analysis skipped"})
             except Exception as e:
-                errors.append({"phase": "analysis", "file": fpath, "error": str(e)})
+                errors.append({"phase": "analysis", "file": fpath, "level": "error", "error": str(e)})
 
             self.progress.advance()
+
+        # Mode --taint-params : parametres des fonctions jamais appelees
+        if self.config.taint_params:
+            extra = findings_from_uncalled_summaries(self.global_context, self.rules)
+            if self.config.vuln_types:
+                extra = [f for f in extra if f.vuln_type in self.config.vuln_types]
+            all_findings.extend(extra)
+
+        all_findings = self._dedupe(all_findings)
+        all_findings = self._filter_confidence(all_findings)
 
         self.progress.finish_phase(f"Found {len(all_findings)} potential vulnerabilities")
 
         elapsed = time.monotonic() - start
         return self._build_result(all_findings, len(parsed_files), total_lines, elapsed, errors)
+
+    @staticmethod
+    def _dedupe(findings: list[Finding]) -> list[Finding]:
+        """Un seul finding par (fichier, ligne, type, sink, source) ; garde la meilleure confiance."""
+        best: dict[str, Finding] = {}
+        order: list[str] = []
+        for f in findings:
+            prev = best.get(f.fingerprint)
+            if prev is None:
+                best[f.fingerprint] = f
+                order.append(f.fingerprint)
+            elif f.confidence > prev.confidence or (f.confidence == prev.confidence and len(f.data_flow) > len(prev.data_flow)):
+                best[f.fingerprint] = f
+        return [best[k] for k in order]
+
+    def _filter_confidence(self, findings: list[Finding]) -> list[Finding]:
+        conf_min = Confidence.from_str(self.config.confidence_min or "low")
+        if conf_min <= Confidence.LOW:
+            return findings
+        return [f for f in findings if f.confidence >= conf_min]
 
     def _build_result(
         self,
@@ -168,10 +202,11 @@ class Scanner:
         elapsed: float,
         errors: list[dict],
     ) -> ScanResult:
+        findings = sorted(findings, key=lambda f: (-int(f.severity), -int(f.confidence), f.file_path, f.line))
         summary = compute_summary(findings, files_scanned)
         return ScanResult(
             project_path=str(self.config.project_path),
-            scanner_version="1.0.0",
+            scanner_version=SCANNER_VERSION,
             timestamp=datetime.now().isoformat(),
             scan_duration_seconds=round(elapsed, 2),
             files_scanned=files_scanned,
@@ -183,11 +218,12 @@ class Scanner:
 
 
 def main(project_path, vuln_types=None, output_format="terminal", output_path=None,
-         exclude_patterns=None, severity_min="info", no_color=False, config_path=None):
-    """Point d'entree simplifie pour usage direct."""
-    from config.schema import ScanConfig
+         exclude_patterns=None, severity_min="info", no_color=False, config_path=None,
+         taint_params=False, confidence_min="low", extensions=None):
+    """Point d'entree simplifie pour usage direct (import scanner; scanner.main(...))."""
+    from config.schema import ScanConfig, Severity
 
-    rules = load_rules(config_path or "config/rules.yaml")
+    rules = load_rules(config_path)
     if vuln_types:
         rules = rules.filter_by_types(vuln_types)
 
@@ -196,17 +232,23 @@ def main(project_path, vuln_types=None, output_format="terminal", output_path=No
         vuln_types=vuln_types or rules.get_vuln_types(),
         rules=rules,
         severity_min=severity_min,
+        confidence_min=confidence_min,
         exclude_patterns=exclude_patterns or [],
         output_path=Path(output_path) if output_path else None,
         output_format=output_format,
         no_color=no_color,
+        taint_params=taint_params,
+        extensions=extensions,
     )
 
     scanner = Scanner(config)
     result = scanner.run()
 
-    # Reporter
+    sev_min = Severity.from_str(severity_min)
+    result.findings = [f for f in result.findings if f.severity >= sev_min]
+    result.summary = compute_summary(result.findings, result.files_scanned)
+
     from report import generate_report
-    generate_report(result, output_format, output_path)
+    generate_report(result, output_format, output_path, no_color=no_color)
 
     return result

@@ -156,6 +156,9 @@ class JSONReporter:
                 "detectionMode": finding.detection_mode,
                 "sinkFunction": finding.sink_function,
                 "sourceVariable": finding.source_variable,
+                "function": finding.function_name,
+                "tags": list(finding.tags),
+                "sanitizersApplied": list(finding.sanitizers_applied),
             },
         }
 

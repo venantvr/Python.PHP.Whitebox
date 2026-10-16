@@ -1,37 +1,34 @@
-# detectors/base.py - BaseDetector ABC
+# detectors/base.py - BaseDetector ABC + GenericDetector
 
 from __future__ import annotations
 
-import hashlib
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import TYPE_CHECKING
 
-from config.schema import Severity, Confidence
+from config.schema import Severity
 from report.finding import Finding
-from analysis.taint_state import TaintFact, TraceStep
 
 if TYPE_CHECKING:
     from config.loader import RulesConfig
 
 
 class BaseDetector(ABC):
-    """Classe abstraite pour les 16 detecteurs de vulnerabilites.
+    """Classe de base des detecteurs de vulnerabilites.
 
-    Chaque detecteur specialise filtre les findings bruts produits par le
-    TaintTracker et le PatternDetector, verifie la pertinence contextuelle
-    (sanitizers corrects, sink attendu), et enrichit les metadata (CWE, OWASP,
-    remediation).
+    Le TaintTracker garantit deja, label par label, qu'un finding n'est emis
+    que si la categorie de vuln est encore dangereuse apres les sanitizers.
+    Les detecteurs servent donc a :
+      - filtrer les findings par type (un detecteur = un vuln_type),
+      - appliquer des regles contextuelles specifiques (ex: commentaires pour
+        les secrets, flags libxml pour XXE),
+      - enrichir les metadata (CWE, OWASP, remediation).
 
-    Le flow est : TaintTracker produit les findings bruts -> chaque detecteur
-    appelle detect() pour filtrer par vuln_type, verifier la sanitization, et
-    retourner les findings valides via build_finding().
-
-    Pour creer un nouveau detecteur :
-      1. Heriter de BaseDetector
-      2. Definir vuln_type (ex: "sql_injection")
-      3. Implementer detect() qui filtre par vuln_type et appelle
-         is_properly_sanitized() pour eliminer les faux positifs
-      4. Enregistrer dans detectors/__init__.py REGISTRY
+    Pour creer un detecteur specialise :
+      1. Heriter de BaseDetector, definir vuln_type
+      2. Surcharger accept(finding, source) -> bool (ou detect() entierement)
+      3. L'enregistrer dans detectors/__init__.py REGISTRY
+    Les types declares dans rules.yaml sans classe dediee sont pris en charge
+    par GenericDetector.
     """
 
     vuln_type: str = ""
@@ -39,8 +36,10 @@ class BaseDetector(ABC):
     cwe: str = ""
     owasp: str = ""
 
-    def __init__(self, rules: "RulesConfig"):
+    def __init__(self, rules: "RulesConfig", vuln_type: str = ""):
         self.rules = rules
+        if vuln_type:
+            self.vuln_type = vuln_type
         vuln_rule = rules.vulnerabilities.get(self.vuln_type)
         if vuln_rule:
             self.default_severity = vuln_rule.severity
@@ -56,20 +55,40 @@ class BaseDetector(ABC):
             self.description = ""
             self.remediation = ""
 
-    @abstractmethod
     def detect(self, findings: list[Finding], file_path: str, source: str) -> list[Finding]:
-        """Filtre et enrichit les findings pour ce type de vuln."""
-        ...
+        """Filtre les findings de ce type et applique accept()."""
+        result: list[Finding] = []
+        for f in findings:
+            if f.vuln_type != self.vuln_type:
+                continue
+            if not self.accept(f, source):
+                continue
+            result.append(self.enrich(f))
+        return result
+
+    def accept(self, finding: Finding, source: str) -> bool:
+        """Regle contextuelle specifique ; True par defaut."""
+        return not self.is_properly_sanitized(finding)
 
     def is_properly_sanitized(self, finding: Finding) -> bool:
-        """Verifie si les sanitizers appliques couvrent ce type de vuln."""
-        for step in finding.data_flow:
-            if "Sanitized by" in step.description:
-                func_name = step.description.replace("Sanitized by ", "").rstrip("()")
-                filter_info = self.rules.get_filter_info(func_name)
-                if filter_info and self.vuln_type in filter_info.neutralizes:
-                    return True
+        """Compat : le TaintTracker ne produit que des findings non neutralises.
+
+        Un finding sans trace (cree a la main) est verifie via sanitizers_applied :
+        s'il ne contient que des labels neutralises pour ce type, il est ignore.
+        """
+        if finding.detection_mode != "taint" or finding.data_flow:
+            return False
+        for name in finding.sanitizers_applied:
+            info = self.rules.get_filter_info(name)
+            if info and self.vuln_type in info.neutralizes:
+                return True
         return False
+
+    def enrich(self, finding: Finding) -> Finding:
+        """Complete les metadata manquantes (CWE/OWASP/remediation)."""
+        if finding.cwe and finding.owasp and finding.remediation:
+            return finding
+        return self.build_finding(finding)
 
     def build_finding(self, finding: Finding, **overrides) -> Finding:
         """Construit un Finding enrichi avec les metadata du detecteur."""
@@ -77,10 +96,10 @@ class BaseDetector(ABC):
             vuln_type=overrides.get("vuln_type", finding.vuln_type),
             severity=overrides.get("severity", finding.severity),
             confidence=overrides.get("confidence", finding.confidence),
-            cwe=overrides.get("cwe", self.cwe or finding.cwe),
-            owasp=overrides.get("owasp", self.owasp or finding.owasp),
+            cwe=overrides.get("cwe", finding.cwe or self.cwe),
+            owasp=overrides.get("owasp", finding.owasp or self.owasp),
             title=overrides.get("title", finding.title),
-            description=overrides.get("description", finding.description),
+            description=overrides.get("description", finding.description or self.description),
             file_path=finding.file_path,
             line=finding.line,
             column=finding.column,
@@ -88,6 +107,16 @@ class BaseDetector(ABC):
             source_variable=finding.source_variable,
             code_snippet=finding.code_snippet,
             data_flow=finding.data_flow,
-            remediation=overrides.get("remediation", self.remediation or finding.remediation),
+            remediation=overrides.get("remediation", finding.remediation or self.remediation),
             detection_mode=finding.detection_mode,
+            function_name=finding.function_name,
+            tags=list(finding.tags),
+            sanitizers_applied=list(finding.sanitizers_applied),
         )
+
+
+class GenericDetector(BaseDetector):
+    """Detecteur par defaut pour tout vuln_type declare dans rules.yaml."""
+
+    def __init__(self, rules: "RulesConfig", vuln_type: str):
+        super().__init__(rules, vuln_type)

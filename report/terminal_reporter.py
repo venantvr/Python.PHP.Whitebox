@@ -133,7 +133,7 @@ class TerminalReporter:
     def _banner(self) -> list[str]:
         c = self.c
         lines = [self._separator()]
-        lines.append(f"  {c.CYAN}{c.BOLD}PHP Sec Scan{c.RESET}  {c.DIM}— Static Security Scanner for PHP{c.RESET}")
+        lines.append(f"  {c.CYAN}{c.BOLD}Python.PHP.Whitebox{c.RESET}  {c.DIM}— Static Security Scanner for PHP{c.RESET}")
         lines.append(self._separator())
         return lines
 
@@ -257,6 +257,14 @@ class TerminalReporter:
             for snippet_line in f.code_snippet.splitlines():
                 lines.append(f"        {c.YELLOW}{snippet_line}{c.RESET}")
 
+        # --- Contexte (fonction, tags, sanitizers vus) ---
+        if f.function_name or f.tags:
+            lines.append("")
+            if f.function_name:
+                lines.append(f"      {c.DIM}Function:{c.RESET} {f.function_name}()")
+            if f.tags:
+                lines.append(f"      {c.DIM}Tags:{c.RESET} {', '.join(f.tags)}")
+
         # --- Data flow trace ---
         if f.data_flow:
             lines.append("")
@@ -319,7 +327,11 @@ class TerminalReporter:
         lines.append("")
         for err in result.errors:
             file_path = err.get("file", "unknown")
-            message = err.get("message", str(err))
+            message = err.get("error") or err.get("message") or str(err)
+            level = err.get("level", "error")
+            if level == "warning":
+                lines.append(f"    {c.YELLOW}?{c.RESET} {c.DIM}{file_path}:{c.RESET} {message}")
+                continue
             lines.append(f"    {c.RED}!{c.RESET} {c.DIM}{file_path}:{c.RESET} {message}")
         lines.append("")
         return lines

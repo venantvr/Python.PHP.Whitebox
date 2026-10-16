@@ -336,6 +336,8 @@ class HTMLReporter:
         <div class="finding-meta">
           <span>Sink: <code>{_esc(f.sink_function)}</code></span>
           <span>Source: <code>{_esc(f.source_variable)}</code></span>
+          {f'<span>Function: <code>{_esc(f.function_name)}()</code></span>' if f.function_name else ''}
+          {f'<span>Tags: <code>{_esc(", ".join(f.tags))}</code></span>' if f.tags else ''}
           <span>Detection: <code>{_esc(f.detection_mode)}</code></span>
           <span>Fingerprint: <code>{_esc(f.fingerprint)}</code></span>
         </div>

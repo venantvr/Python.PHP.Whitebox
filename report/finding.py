@@ -35,6 +35,9 @@ class Finding:
     remediation: str = ""
     detection_mode: str = "taint"
     fingerprint: str = ""
+    function_name: str = ""                       # fonction/methode contenant le sink
+    tags: list[str] = field(default_factory=list)  # ex: "privileged-context", "uncalled-entry-point"
+    sanitizers_applied: list[str] = field(default_factory=list)  # filtres vus sur le chemin (informatif)
 
     def __post_init__(self):
         if not self.fingerprint:
@@ -57,11 +60,14 @@ class ScanSummary:
     files_clean: int = 0
 
 
+SCANNER_VERSION = "2.0.0"
+
+
 @dataclass
 class ScanResult:
     """Resultat complet d'un scan."""
     project_path: str = ""
-    scanner_version: str = "1.0.0"
+    scanner_version: str = SCANNER_VERSION
     timestamp: str = ""
     scan_duration_seconds: float = 0.0
     files_scanned: int = 0
