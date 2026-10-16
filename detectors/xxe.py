@@ -4,13 +4,11 @@ from report.finding import Finding
 
 
 class XXEDetector(BaseDetector):
+    """Supprime le finding si libxml_disable_entity_loader(true) est present.
+    La confiance est ajustee par ContextAnalyzer selon LIBXML_NOENT."""
     vuln_type = "xxe"
 
-    def detect(self, findings: list[Finding], file_path: str, source: str) -> list[Finding]:
-        result = []
-        for f in findings:
-            if f.vuln_type != self.vuln_type:
-                continue
-            # Le ContextAnalyzer filtre deja les XXE proteges
-            result.append(f)
-        return result
+    def accept(self, finding: Finding, source: str) -> bool:
+        if "libxml_disable_entity_loader(true)" in source.replace(" ", ""):
+            return False
+        return True

@@ -1,73 +1,55 @@
-# analysis/context_analyzer.py - Suppression de faux positifs contextuels
+# analysis/context_analyzer.py - Ajustements contextuels des findings
 
 from __future__ import annotations
 
+import re
+from dataclasses import replace
+
+from config.schema import Confidence
 from report.finding import Finding
 
 
 class ContextAnalyzer:
-    """Post-traitement pour supprimer les faux positifs contextuels.
+    """Post-traitement contextuel, apres le TaintTracker et avant les detecteurs.
 
-    Intervient apres le TaintTracker et avant les detecteurs specialises.
-    Regles de suppression :
-      - XXE : supprime si libxml_disable_entity_loader() present dans le fichier.
-      - Open redirect : supprime si le header n'est pas "Location:".
-      - SQL injection : annote si un prepared statement est detecte a proximite.
+    Regles :
+      - XXE : en PHP >= 8 le chargement d'entites externes est desactive par
+        defaut. Confiance HIGH seulement si LIBXML_NOENT / LIBXML_DTDLOAD /
+        substituteEntities / resolveExternals apparaissent dans le fichier,
+        sinon LOW. Supprime si libxml_disable_entity_loader(true) est present.
+      - SQL injection : annote le titre si un prepared statement avec
+        parametres lies est visible a proximite (possible faux positif).
+      - Findings dans des fichiers de test/fixtures : confiance reduite.
     """
 
+    _XXE_ENABLERS = re.compile(r"LIBXML_NOENT|LIBXML_DTDLOAD|substituteEntities\s*=\s*true|resolveExternals\s*=\s*true")
+    _TEST_PATH = re.compile(r"(?i)(^|/)(tests?|spec|fixtures?|examples?|samples?|demo)(/|$)")
+
     def refine_findings(self, findings: list[Finding], source_code: str) -> list[Finding]:
-        """Filtre et raffine les findings en fonction du contexte."""
         refined: list[Finding] = []
         source_lower = source_code.lower()
+        xxe_enabled = bool(self._XXE_ENABLERS.search(source_code))
 
         for f in findings:
             if f.vuln_type == "xxe":
-                if self._has_entity_loader_disabled(source_lower):
+                if "libxml_disable_entity_loader(true)" in source_lower.replace(" ", ""):
                     continue
+                if not xxe_enabled and f.confidence > Confidence.LOW:
+                    f = replace(f, confidence=Confidence.LOW,
+                                title=f.title + " (entity loading not explicitly enabled: exploitable on PHP < 8 / with LIBXML_NOENT)")
 
-            if f.vuln_type == "open_redirect":
-                if not self._is_location_header(source_code, f.line):
-                    continue
-
-            if f.vuln_type == "sql_injection":
+            if f.vuln_type == "sql_injection" and f.detection_mode == "taint":
                 if self._uses_prepared_statement_near(source_code, f.line):
-                    f = Finding(
-                        vuln_type=f.vuln_type,
-                        severity=f.severity,
-                        confidence=f.confidence,
-                        cwe=f.cwe,
-                        owasp=f.owasp,
-                        title=f.title + " (possible prepared statement nearby)",
-                        description=f.description,
-                        file_path=f.file_path,
-                        line=f.line,
-                        column=f.column,
-                        sink_function=f.sink_function,
-                        source_variable=f.source_variable,
-                        code_snippet=f.code_snippet,
-                        data_flow=f.data_flow,
-                        remediation=f.remediation,
-                        detection_mode=f.detection_mode,
-                    )
+                    f = replace(f, title=f.title + " (possible prepared statement nearby)")
 
             refined.append(f)
 
         return refined
 
-    def _has_entity_loader_disabled(self, source_lower: str) -> bool:
-        return "libxml_disable_entity_loader" in source_lower
-
-    def _is_location_header(self, source: str, line: int) -> bool:
-        """Verifie si la ligne contient un header Location."""
-        lines = source.splitlines()
-        if 0 < line <= len(lines):
-            return "location" in lines[line - 1].lower()
-        return False
-
-    def _uses_prepared_statement_near(self, source: str, line: int, window: int = 10) -> bool:
-        """Verifie si prepare()/bindParam sont utilises a proximite."""
+    @staticmethod
+    def _uses_prepared_statement_near(source: str, line: int, window: int = 6) -> bool:
         lines = source.splitlines()
         start = max(0, line - 1 - window)
         end = min(len(lines), line + window)
         context = "\n".join(lines[start:end]).lower()
-        return "prepare(" in context and ("bindparam" in context or "bindvalue" in context or "execute(" in context)
+        return "prepare(" in context and ("bindparam" in context or "bindvalue" in context or "bind_param" in context)
